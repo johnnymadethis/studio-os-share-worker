@@ -6,7 +6,7 @@ Files stream from **your own** R2 bucket; nothing routes through anyone else's a
 
 ## One-click setup
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/OWNER/REPO)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/johnnymadethis/studio-os-share-worker)
 
 Clicking the button:
 
