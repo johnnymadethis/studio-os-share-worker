@@ -1,0 +1,5 @@
+# The shared secret between the Studio OS app and this Worker (Bearer auth on write endpoints).
+# During "Deploy to Cloudflare" you'll be asked for this value — generate one with:
+#     openssl rand -hex 32
+# Then paste the SAME value into: Studio OS → Settings → Cloud Share → Share Token.
+SHARE_TOKEN=

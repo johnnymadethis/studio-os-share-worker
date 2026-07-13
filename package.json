@@ -1,0 +1,11 @@
+{
+  "name": "studio-share-worker",
+  "private": true,
+  "cloudflare": {
+    "bindings": {
+      "SHARE_TOKEN": {
+        "description": "Shared secret between the Studio OS app and this Worker. Generate one with `openssl rand -hex 32`, then paste the SAME value into the app's Settings → Cloud Share → Share Token."
+      }
+    }
+  }
+}

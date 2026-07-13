@@ -1,0 +1,28 @@
+{
+  // Portable deploy config for the "Deploy to Cloudflare" button. No custom domain and no
+  // account-specific resource IDs — Cloudflare provisions fresh KV / R2 / D1 / Durable Object in the
+  // deploying user's account and rewrites the empty ids below. The Worker is served at
+  // https://studio-share.<their-account>.workers.dev (paste that URL into the app's Settings).
+  "name": "studio-share",
+  "main": "src/worker.js",
+  "compatibility_date": "2024-11-01",
+  "workers_dev": true,
+
+  "kv_namespaces": [
+    { "binding": "SHARES", "id": "" }
+  ],
+  "r2_buckets": [
+    { "binding": "BUCKET", "bucket_name": "studio-os" }
+  ],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "studio-feedback", "database_id": "" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "LISTEN", "class_name": "ListenRoom" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1-listen-room", "new_sqlite_classes": ["ListenRoom"] }
+  ]
+}
