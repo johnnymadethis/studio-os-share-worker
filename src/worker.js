@@ -250,6 +250,22 @@ async function handle(request, env, ctx) {
     const url = new URL(request.url)
     const p = url.pathname
 
+    // Team members (label edition): a member token acts as the owner token for exactly the routes
+    // its role allows — one choke point here, so no route below needs to know about members.
+    // x-studio-actor carries who did it, for the activity log.
+    const bearer = (request.headers.get("authorization") || "").replace(/^Bearer /, "")
+    if (bearer && bearer !== env.SHARE_TOKEN && bearer.length <= 128) {
+      const m = JSON.parse((await env.SHARES.get("member:" + bearer)) || "null")
+      if (m) {
+        if (p === "/api/whoami") return json({ type: "member", name: m.name, role: m.role })
+        if (!memberMay(m.role, request.method, p)) return json({ error: "forbidden" }, 403)
+        const h = new Headers(request.headers)
+        h.set("authorization", `Bearer ${env.SHARE_TOKEN}`)
+        h.set("x-studio-actor", m.name)
+        request = new Request(request, { headers: h })
+      }
+    }
+
     // Listen Together: WebSocket room per share id. The app connects as HOST (?role=host&t=<token>,
     // validated); the share page connects as guest (public — knowing the unguessable id IS the
     // invite). The Durable Object relays host play/pause/seek to guests + presence both ways.
@@ -819,6 +835,51 @@ async function handle(request, env, ctx) {
       return json(who.owner ? { type: "owner" } : { type: "guest", name: who.name, artists: who.artists, calendar: who.calendar })
     }
 
+    // Team members (label edition): one token per person, with a role (admin / member / viewer).
+    // Managed by the owner token or an admin member (both arrive here as the owner token).
+    if (p === "/api/members" || p.startsWith("/api/members/")) {
+      if ((request.headers.get("authorization") || "") !== `Bearer ${env.SHARE_TOKEN}`) return json({ error: "unauthorized" }, 401)
+      const token = p.slice("/api/members/".length)
+      if (p === "/api/members" && request.method === "GET") {
+        const out = []
+        let cursor
+        do {
+          const r = await env.SHARES.list({ prefix: "member:", cursor })
+          for (const k of r.keys) {
+            const rec = JSON.parse((await env.SHARES.get(k.name)) || "null")
+            if (rec) out.push({ token: k.name.slice("member:".length), name: rec.name, role: rec.role, createdAt: rec.createdAt })
+          }
+          cursor = r.list_complete ? undefined : r.cursor
+        } while (cursor)
+        return json(out)
+      }
+      if (p === "/api/members" && request.method === "POST") {
+        const b = await request.json().catch(() => null)
+        const name = String(b?.name || "").trim().slice(0, 60)
+        if (!name || !MEMBER_ROLES.includes(b?.role)) return json({ error: "name and role (admin/member/viewer) required" }, 400)
+        const t = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "")
+        await env.SHARES.put("member:" + t, JSON.stringify({ name, role: b.role, createdAt: Date.now() }))
+        return json({ token: t, name, role: b.role })
+      }
+      if (token && request.method === "PATCH") {
+        const rec = JSON.parse((await env.SHARES.get("member:" + token)) || "null")
+        if (!rec) return json({ error: "not found" }, 404)
+        const b = await request.json().catch(() => null)
+        if (b?.role !== undefined) {
+          if (!MEMBER_ROLES.includes(b.role)) return json({ error: "bad role" }, 400)
+          rec.role = b.role
+        }
+        if (typeof b?.name === "string" && b.name.trim()) rec.name = b.name.trim().slice(0, 60)
+        await env.SHARES.put("member:" + token, JSON.stringify(rec))
+        return json({ token, name: rec.name, role: rec.role })
+      }
+      if (token && request.method === "DELETE") {
+        await env.SHARES.delete("member:" + token)
+        return json({ ok: true })
+      }
+      return json({ error: "not found" }, 404)
+    }
+
     // Guest-link management (owner only): create/list/revoke scoped iPhone links for other people.
     if (p === "/api/guests" && request.method === "GET") {
       if ((request.headers.get("authorization") || "") !== `Bearer ${env.SHARE_TOKEN}`) return json({ error: "unauthorized" }, 401)
@@ -1175,7 +1236,7 @@ async function handle(request, env, ctx) {
       let shares = 0, kc
       do {
         const r = await env.SHARES.list({ limit: 1000, cursor: kc })
-        shares += (r.keys || []).filter((k) => !k.name.startsWith("__") && !k.name.startsWith("r:") && !k.name.startsWith("rn:") && !k.name.startsWith("rs:") && !k.name.startsWith("cfg:")).length   // skip reserved + presave + review-notes + live-session keys
+        shares += (r.keys || []).filter((k) => !k.name.startsWith("__") && !k.name.startsWith("r:") && !k.name.startsWith("rn:") && !k.name.startsWith("rs:") && !k.name.startsWith("cfg:") && !k.name.startsWith("guest:") && !k.name.startsWith("member:")).length   // skip reserved + presave + review-notes + live-session keys
         kc = r.list_complete ? undefined : r.cursor
       } while (kc)
       await env.SHARES.put("__usage", JSON.stringify({ t: Date.now(), bytes, objects, shares }))
@@ -1582,6 +1643,22 @@ function zipStream(env, files) {
     },
   })
 }
+const MEMBER_ROLES = ["admin", "member", "viewer"]
+// What each team role may call (owner-token routes only; public pages need no token). Admin = all.
+// Viewers read; members also upload, share and move/rename — deleting files and managing the team
+// stay with admins.
+const MEMBER_READ = [["GET", "/list"], ["GET", "/file"], ["GET", "/object"], ["HEAD", "/object"],
+  ["GET", "/api/state"], ["GET", "/api/state/photo/*"], ["GET", "/api/sheets"], ["GET", "/api/usage"],
+  ["GET", "/api/activity"]]
+const MEMBER_EDIT = [["PUT", "/object"], ["PUT", "/object/chunk"], ["POST", "/object/assemble"],
+  ["POST", "/api/share"], ["*", "/api/share/*"], ["POST", "/relink"], ["POST", "/move"], ["POST", "/rename"],
+  ["*", "/api/sessions"], ["*", "/api/rs"], ["*", "/api/rs/*"]]
+function memberMay(role, method, p) {
+  if (role === "admin") return true
+  const rules = role === "member" ? MEMBER_READ.concat(MEMBER_EDIT) : role === "viewer" ? MEMBER_READ : []
+  return rules.some(([m, r]) => (m === "*" || m === method) && (r.endsWith("/*") ? p.startsWith(r.slice(0, -1)) : p === r))
+}
+
 function randomId(n = 16) { const a = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; const b = crypto.getRandomValues(new Uint8Array(n)); return Array.from(b, (x) => a[x % a.length]).join("") }
 
 // Contributor-name match for signing: case- and diacritic-insensitive, whitespace-collapsed — the
