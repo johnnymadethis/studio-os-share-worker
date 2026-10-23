@@ -356,6 +356,13 @@ async function handle(request, env, ctx) {
       const b = await request.json().catch(() => null)
       const text = (typeof b?.text === "string" ? b.text : "").trim().slice(0, 60)
       await env.SHARES.put("cfg:brandFooter", text || "Shared with Studio OS")
+      // Optional per-deployment logo (a label's own mark) served at /logo in place of the built-in
+      // one. Base64 PNG, ~256px from the app; "" clears it back to the default.
+      if (typeof b?.logo === "string") {
+        if (!b.logo) await env.SHARES.delete("cfg:brandLogo")
+        else if (b.logo.length <= 400000 && /^[A-Za-z0-9+/=]+$/.test(b.logo)) await env.SHARES.put("cfg:brandLogo", b.logo)
+        else return json({ error: "bad logo" }, 400)
+      }
       return json({ ok: true })
     }
 
@@ -1168,7 +1175,7 @@ async function handle(request, env, ctx) {
       let shares = 0, kc
       do {
         const r = await env.SHARES.list({ limit: 1000, cursor: kc })
-        shares += (r.keys || []).filter((k) => !k.name.startsWith("__") && !k.name.startsWith("r:") && !k.name.startsWith("rn:") && !k.name.startsWith("rs:")).length   // skip reserved + presave + review-notes + live-session keys
+        shares += (r.keys || []).filter((k) => !k.name.startsWith("__") && !k.name.startsWith("r:") && !k.name.startsWith("rn:") && !k.name.startsWith("rs:") && !k.name.startsWith("cfg:")).length   // skip reserved + presave + review-notes + live-session keys
         kc = r.list_complete ? undefined : r.cursor
       } while (kc)
       await env.SHARES.put("__usage", JSON.stringify({ t: Date.now(), bytes, objects, shares }))
@@ -1203,8 +1210,10 @@ async function handle(request, env, ctx) {
     }
 
     if (p === "/logo") {
-      const bytes = Uint8Array.from(atob(LOGO_B64), (c) => c.charCodeAt(0))
-      return new Response(bytes, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } })
+      const custom = await env.SHARES.get("cfg:brandLogo")
+      const bytes = Uint8Array.from(atob(custom || LOGO_B64), (c) => c.charCodeAt(0))
+      // A custom logo can change from Settings, so browsers re-check it sooner than the built-in one.
+      return new Response(bytes, { headers: { "content-type": "image/png", "cache-control": `public, max-age=${custom ? 600 : 86400}` } })
     }
     if (p.startsWith("/s/")) {
       const meta = await meta_(env, p.slice(3))
