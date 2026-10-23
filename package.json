@@ -1,6 +1,10 @@
 {
   "name": "studio-share-worker",
   "private": true,
+  "type": "module",
+  "dependencies": {
+    "postal-mime": "^2.7.6"
+  },
   "cloudflare": {
     "bindings": {
       "SHARE_TOKEN": {
