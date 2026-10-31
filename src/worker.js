@@ -3,9 +3,6 @@
 // Modes: listen+download or listen-only (/d blocked). Waveform player, glass controls.
 
 import { LOGO_B64 } from "./logo.js"
-// MIME parsing for the invoice mailbox. Hand-rolling multipart/base64/quoted-printable is exactly
-// the kind of "almost works" parser that breaks on the one mail that matters.
-import PostalMime from "postal-mime"
 
 export default {
   async fetch(request, env, ctx) {
@@ -16,57 +13,13 @@ export default {
     }
   },
 
-  /// Hourly tick: the trash/staging sweep, and once a day an invoice that's been sitting unpaid
-  /// for a month gets a nudge.
+  /// Hourly tick: the trash/staging sweep (plus a once-a-day owner reminder, fenced below).
   async scheduled(event, env, ctx) {
     ctx.waitUntil(sweepTrash(env))   // also drains stale __up/ chunked-upload staging
-    // Once a day at 10:00 Romania — asked of the zone, so it stays 10:00 across the DST switch.
-    if (roHour(event.scheduledTime) === 10) {
-      try { await remindUnpaidRent(env) } catch (e) { await logErr(env, `cron rent: ${(e && e.message) || e}`) }
-    }
   },
 
-  /// Studio Rent's inbox. The landlord's invoices are forwarded here by a Gmail filter; every PDF
-  /// lands in R2 and shows up as pending in the app, which reads the amounts itself (PDFKit) —
-  /// no PDF parser on the edge.
-  async email(message, env, ctx) {
-    try { await takeInvoiceMail(message, env) }
-    catch (e) { await logErr(env, `email: ${(e && e.message) || e}`) }
-  },
 }
 
-async function takeInvoiceMail(message, env) {
-  const parsed = await PostalMime.parse(await new Response(message.raw).arrayBuffer())
-  const pdfs = (parsed.attachments || []).filter(a =>
-    (a.mimeType || "").includes("pdf") || /\.pdf$/i.test(a.filename || ""))
-  if (!pdfs.length) {
-    // No PDF → not an invoice. Most likely Gmail's OWN "confirm this forwarding address" mail, which
-    // has nowhere else to be read (this inbox has no UI) — stash it so it can be read back out via
-    // the KV, instead of silently dropping something the owner is waiting on.
-    await env.SHARES.put("__mailPending", JSON.stringify({
-      from: parsed.from?.address || "", subject: parsed.subject || "",
-      text: (parsed.text || "").slice(0, 4000), at: Date.now(),
-    }))
-    // Say so instead of going quiet: a forward that lost its attachments looks exactly like nothing
-    // happening, and the only way to tell used to be asking the KV.
-    await sendPush(env, "📭 Mail fără PDF",
-                   `"${(parsed.subject || "fără subiect").slice(0, 60)}" a ajuns, dar n-avea niciun atașament.`,
-                   undefined, "rent")
-    return
-  }
-
-  const inbox = JSON.parse((await env.SHARES.get("__rentInbox")) || "[]")
-  const stamp = new Date().toISOString().slice(0, 10)
-  for (const [i, a] of pdfs.entries()) {
-    const safe = (a.filename || `factura-${i + 1}.pdf`).replace(/[^\w.\-]+/g, "_")
-    const key = `rent/${stamp}-${Date.now()}-${i}-${safe}`
-    await env.BUCKET.put(key, a.content, { httpMetadata: { contentType: "application/pdf" } })
-    inbox.push({ key, name: safe, from: parsed.from?.address || "", subject: parsed.subject || "", at: Date.now() })
-  }
-  while (inbox.length > 60) inbox.shift()          // the app consumes these; keep the tail short
-  await env.SHARES.put("__rentInbox", JSON.stringify(inbox))
-  await sendPush(env, "📄 Facturi noi", `${pdfs.length} PDF de la ${parsed.from?.address || "administrator"}`, undefined, "rent")
-}
 
 // Records a worker-side error to a small ring buffer in KV so the app's Health → Problems can
 // pull it (`/api/errors`). Reserved key "__errlog" (excluded from the share count).
@@ -202,7 +155,7 @@ async function sendPush(env, title, body, kind, tap) {
           "apns-push-type": "alert",
           "apns-priority": "10",
         },
-        // `tap` tells the app WHICH screen to open when the banner is tapped ("rent").
+        // `tap` tells the app WHICH screen to open when the banner is tapped.
         // `content-available` wakes the app so it can fetch + parse BEFORE the banner is tapped —
         // by the time the owner opens it, the month is already on screen.
         body: JSON.stringify({ aps: { alert: { title, body: body.slice(0, 200) }, sound: "default", "content-available": 1 }, tap }),
@@ -616,43 +569,6 @@ async function handle(request, env, ctx) {
 
 
 
-    // --- Studio Rent: the forwarded-invoice inbox + the parsed months. Owner only, all of it. ---
-    if (p.startsWith("/api/rent")) {
-      if ((request.headers.get("authorization") || "") !== `Bearer ${env.SHARE_TOKEN}`) return json({ error: "unauthorized" }, 401)
-
-      // What the mail handler dropped in and the app hasn't read yet.
-      if (p === "/api/rent/inbox" && request.method === "GET") {
-        return json({ items: JSON.parse((await env.SHARES.get("__rentInbox")) || "[]") })
-      }
-      // The PDF itself — the app parses the amounts locally and keeps its own copy.
-      if (p === "/api/rent/file" && request.method === "GET") {
-        const key = url.searchParams.get("key") || ""
-        if (!key.startsWith("rent/")) return json({ error: "bad key" }, 400)
-        const obj = await env.BUCKET.get(key)
-        if (!obj) return json({ error: "not found" }, 404)
-        return new Response(obj.body, { headers: { "content-type": "application/pdf" } })
-      }
-      // Consumed: drop it from the pending list (the R2 copy stays as the archive).
-      if (p === "/api/rent/seen" && request.method === "POST") {
-        const b = await request.json().catch(() => ({}))
-        const done = new Set(Array.isArray(b.keys) ? b.keys : [])
-        const left = JSON.parse((await env.SHARES.get("__rentInbox")) || "[]").filter(x => !done.has(x.key))
-        await env.SHARES.put("__rentInbox", JSON.stringify(left))
-        return json({ ok: true, left: left.length })
-      }
-      // The table itself, so it survives a reinstall and matches on every device.
-      if (p === "/api/rent" && request.method === "GET") {
-        return new Response((await env.SHARES.get("__rent")) || "[]", { headers: { "content-type": "application/json" } })
-      }
-      if (p === "/api/rent" && request.method === "PUT") {
-        const raw = await request.text()
-        if (raw.length > 512 * 1024) return json({ error: "too large" }, 413)
-        try { JSON.parse(raw) } catch (e) { return json({ error: "bad json" }, 400) }
-        await env.SHARES.put("__rent", raw)
-        return json({ ok: true })
-      }
-      return json({ error: "not found" }, 404)
-    }
 
 
 
@@ -1782,45 +1698,6 @@ async function sweepTrash(env) {
 
 
 
-const RO_TZ = "Europe/Bucharest"
-
-
-
-/// Local hour in Romania right now (0–23).
-function roHour(at) {
-  return +new Intl.DateTimeFormat("en-US", { timeZone: RO_TZ, hour12: false, hour: "2-digit" })
-    .format(new Date(at)) % 24
-}
-
-
-/// An invoice still unpaid a month after it arrived. Repeats every 3 days after that — a nudge, not
-/// a nag. Only the owner gets these; the landlord's bills are nobody else's business.
-async function remindUnpaidRent(env) {
-  const months = JSON.parse((await env.SHARES.get("__rent")) || "[]")
-  if (!Array.isArray(months) || !months.length) return
-  const now = Date.now()
-  const MONTH = 30 * 86400000
-  let touched = false
-
-  for (const m of months) {
-    const rentDue = m.rentTotal && !(m.rentPaid ?? m.paid)
-    const utilDue = m.utilTotal && !(m.utilPaid ?? m.paid)
-    if (!rentDue && !utilDue) continue
-    // A month from the MAIL, and only when that date is known. Rows imported before this existed
-    // stay silent rather than being nagged about on a guessed date.
-    const since = m.receivedAt
-    if (!since || now - since < MONTH) continue
-    if (m.remindedAt && now - m.remindedAt < 3 * 86400000) continue
-
-    const days = Math.floor((now - since) / 86400000)
-    const what = [rentDue ? "chiria" : null, utilDue ? "utilitățile" : null].filter(Boolean).join(" și ")
-    await sendPush(env, "💸 Factură neplătită",
-                   `${what} pe ${m.key} — ${days} zile de la primire`, undefined, "rent")
-    m.remindedAt = now
-    touched = true
-  }
-  if (touched) await env.SHARES.put("__rent", JSON.stringify(months))
-}
 
 async function listAll(env, prefix) {
   const keys = []; let cursor
